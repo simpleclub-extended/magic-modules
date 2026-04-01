@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"log"
 	"reflect"
+	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/terraform-provider-google/google/tpgresource"
@@ -543,4 +545,137 @@ func MissingBindings(a, b []*cloudresourcemanager.Binding) []*cloudresourcemanag
 		})
 	}
 	return results
+}
+
+// serviceAgentSuffixes contains the well-known email domain suffixes used by
+// Google-managed service agents. These accounts are created and managed by
+// Google Cloud services and typically should not be manipulated by users.
+var serviceAgentSuffixes = []string{
+	"@cloudservices.gserviceaccount.com",
+	"@cloudbuild.gserviceaccount.com",
+	"@cloudcomposer-accounts.iam.gserviceaccount.com",
+	"@compute-system.iam.gserviceaccount.com",
+	"@container-analysis.iam.gserviceaccount.com",
+	"@container-engine-robot.iam.gserviceaccount.com",
+	"@dataflow-service-producer-prod.iam.gserviceaccount.com",
+	"@dataproc-accounts.iam.gserviceaccount.com",
+	"@dlp-api.iam.gserviceaccount.com",
+	"@firebase-rules.iam.gserviceaccount.com",
+	"@gae-api-prod.google.com.iam.gserviceaccount.com",
+	"@gcp-sa-aiplatform.iam.gserviceaccount.com",
+	"@gcp-sa-artifactregistry.iam.gserviceaccount.com",
+	"@gcp-sa-bigquerydatatransfer.iam.gserviceaccount.com",
+	"@gcp-sa-cloudbuild.iam.gserviceaccount.com",
+	"@gcp-sa-cloudscheduler.iam.gserviceaccount.com",
+	"@gcp-sa-cloudfunctions.iam.gserviceaccount.com",
+	"@gcp-sa-cloudtasks.iam.gserviceaccount.com",
+	"@gcp-sa-datastream.iam.gserviceaccount.com",
+	"@gcp-sa-eventarc.iam.gserviceaccount.com",
+	"@gcp-sa-firestore.iam.gserviceaccount.com",
+	"@gcp-sa-logging.iam.gserviceaccount.com",
+	"@gcp-sa-monitoring-notification.iam.gserviceaccount.com",
+	"@gcp-sa-pubsub.iam.gserviceaccount.com",
+	"@gcp-sa-secretmanager.iam.gserviceaccount.com",
+	"@gcp-sa-websecurityscanner.iam.gserviceaccount.com",
+	"@gcf-admin-robot.iam.gserviceaccount.com",
+	"@serverless-robot-prod.iam.gserviceaccount.com",
+	"@sourcerepo-service-accounts.iam.gserviceaccount.com",
+}
+
+// serviceAgentPrefixPattern matches the common service-{PROJECT_NUMBER}@ pattern
+// used by many Google-managed service agents.
+var serviceAgentPrefixPattern = regexp.MustCompile(`^service-\d+@`)
+
+// IsServiceAgentMember returns true if the given IAM member string represents a
+// Google-managed service agent. It checks for:
+//  1. The "service-{PROJECT_NUMBER}@*.iam.gserviceaccount.com" pattern
+//  2. The "{PROJECT_NUMBER}@cloudservices.gserviceaccount.com" pattern
+//  3. A curated list of known service agent domain suffixes
+//
+// The member string should include the type prefix (e.g. "serviceAccount:...").
+// Members with "deleted:" prefix are also checked after stripping the prefix.
+func IsServiceAgentMember(member string) bool {
+	// Normalize: strip "deleted:" prefix if present, e.g.
+	// "deleted:serviceAccount:123@cloudservices.gserviceaccount.com?uid=..."
+	m := member
+	if strings.HasPrefix(m, "deleted:") {
+		m = strings.TrimPrefix(m, "deleted:")
+		// Also strip any trailing ?uid=... parameter
+		if idx := strings.Index(m, "?"); idx != -1 {
+			m = m[:idx]
+		}
+	}
+
+	// Only service accounts can be service agents.
+	if !strings.HasPrefix(m, "serviceAccount:") {
+		return false
+	}
+	email := strings.TrimPrefix(m, "serviceAccount:")
+
+	// Pattern 1: {PROJECT_NUMBER}@cloudservices.gserviceaccount.com
+	if strings.HasSuffix(email, "@cloudservices.gserviceaccount.com") {
+		return true
+	}
+
+	// Pattern 2: service-{PROJECT_NUMBER}@*.iam.gserviceaccount.com (broad pattern)
+	if serviceAgentPrefixPattern.MatchString(email) && strings.HasSuffix(email, ".iam.gserviceaccount.com") {
+		return true
+	}
+
+	// Pattern 3: Check against known service agent domain suffixes
+	for _, suffix := range serviceAgentSuffixes {
+		if strings.HasSuffix(email, suffix) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// FilterOutServiceAgentMembers returns a new list of bindings with all service
+// agent members removed. If a binding has a mix of service agent and
+// non-service-agent members, only the non-service-agent members are kept.
+// Bindings that end up with no members are removed entirely.
+func FilterOutServiceAgentMembers(bindings []*cloudresourcemanager.Binding) []*cloudresourcemanager.Binding {
+	var result []*cloudresourcemanager.Binding
+	for _, b := range bindings {
+		var nonAgentMembers []string
+		for _, m := range b.Members {
+			if !IsServiceAgentMember(m) {
+				nonAgentMembers = append(nonAgentMembers, m)
+			}
+		}
+		if len(nonAgentMembers) > 0 {
+			result = append(result, &cloudresourcemanager.Binding{
+				Role:      b.Role,
+				Members:   nonAgentMembers,
+				Condition: b.Condition,
+			})
+		}
+	}
+	return result
+}
+
+// ExtractServiceAgentMembers returns a new list of bindings containing only the
+// service agent members. If a binding has a mix of service agent and
+// non-service-agent members, only the service agent members are kept. Bindings
+// that end up with no service agent members are removed entirely.
+func ExtractServiceAgentMembers(bindings []*cloudresourcemanager.Binding) []*cloudresourcemanager.Binding {
+	var result []*cloudresourcemanager.Binding
+	for _, b := range bindings {
+		var agentMembers []string
+		for _, m := range b.Members {
+			if IsServiceAgentMember(m) {
+				agentMembers = append(agentMembers, m)
+			}
+		}
+		if len(agentMembers) > 0 {
+			result = append(result, &cloudresourcemanager.Binding{
+				Role:      b.Role,
+				Members:   agentMembers,
+				Condition: b.Condition,
+			})
+		}
+	}
+	return result
 }

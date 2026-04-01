@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
 	"github.com/hashicorp/terraform-provider-google/google/tpgresource"
 	transport_tpg "github.com/hashicorp/terraform-provider-google/google/transport"
 
@@ -23,6 +24,15 @@ var IamPolicyBaseSchema = map[string]*schema.Schema{
 	"etag": {
 		Type:     schema.TypeString,
 		Computed: true,
+	},
+	"default_binding_behaviour": {
+		Type:     schema.TypeString,
+		Optional: true,
+		Default:  "override",
+		Description: `Specifies how Google-managed service agent bindings are handled. ` +
+			`"override" (default) replaces the entire IAM policy, removing any bindings not in policy_data. ` +
+			`"ignore" preserves existing service agent bindings, only managing non-service-agent bindings.`,
+		ValidateFunc: validation.StringInSlice([]string{"override", "ignore"}, false),
 	},
 }
 
@@ -88,6 +98,15 @@ func ResourceIamPolicyCreate(newUpdaterFunc NewResourceIamUpdaterFunc) schema.Cr
 	}
 }
 
+// getDefaultBindingBehaviour returns the configured default_binding_behaviour,
+// defaulting to "override" if not set.
+func getDefaultBindingBehaviour(d *schema.ResourceData) string {
+	if v, ok := d.GetOk("default_binding_behaviour"); ok {
+		return v.(string)
+	}
+	return "override"
+}
+
 func ResourceIamPolicyRead(newUpdaterFunc NewResourceIamUpdaterFunc) schema.ReadFunc {
 	return func(d *schema.ResourceData, meta interface{}) error {
 		config := meta.(*transport_tpg.Config)
@@ -105,6 +124,18 @@ func ResourceIamPolicyRead(newUpdaterFunc NewResourceIamUpdaterFunc) schema.Read
 		if err := d.Set("etag", policy.Etag); err != nil {
 			return fmt.Errorf("Error setting etag: %s", err)
 		}
+
+		// In "ignore" mode, filter out service agent bindings from state so they
+		// don't appear in diffs and the user only sees non-service-agent bindings.
+		if getDefaultBindingBehaviour(d) == "ignore" {
+			policy = &cloudresourcemanager.Policy{
+				AuditConfigs: policy.AuditConfigs,
+				Bindings:     FilterOutServiceAgentMembers(policy.Bindings),
+				Etag:         policy.Etag,
+				Version:      policy.Version,
+			}
+		}
+
 		if err := d.Set("policy_data", marshalIamPolicy(policy)); err != nil {
 			return fmt.Errorf("Error setting policy_data: %s", err)
 		}
@@ -122,7 +153,7 @@ func ResourceIamPolicyUpdate(newUpdaterFunc NewResourceIamUpdaterFunc) schema.Up
 			return err
 		}
 
-		if d.HasChange("policy_data") {
+		if d.HasChange("policy_data") || d.HasChange("default_binding_behaviour") {
 			if err := setIamPolicyData(d, updater); err != nil {
 				return err
 			}
@@ -141,12 +172,23 @@ func ResourceIamPolicyDelete(newUpdaterFunc NewResourceIamUpdaterFunc) schema.De
 			return err
 		}
 
-		// Set an empty policy to delete the attached policy.
 		pol := &cloudresourcemanager.Policy{}
 		if v, ok := d.GetOk("etag"); ok {
 			pol.Etag = v.(string)
 		}
 		pol.Version = IamPolicyVersion
+
+		// In "ignore" mode, preserve the existing service agent bindings rather
+		// than wiping the entire policy.
+		if getDefaultBindingBehaviour(d) == "ignore" {
+			existingPolicy, err := updater.GetResourceIamPolicy()
+			if err != nil {
+				return fmt.Errorf("Error reading IAM policy for %s during delete: %s", updater.DescribeResource(), err)
+			}
+			pol.Bindings = ExtractServiceAgentMembers(existingPolicy.Bindings)
+			pol.AuditConfigs = existingPolicy.AuditConfigs
+		}
+
 		err = updater.SetResourceIamPolicy(pol)
 		if err != nil {
 			return err
@@ -162,6 +204,17 @@ func setIamPolicyData(d *schema.ResourceData, updater ResourceIamUpdater) error 
 		return fmt.Errorf("'policy_data' is not valid for %s: %s", updater.DescribeResource(), err)
 	}
 	policy.Version = IamPolicyVersion
+
+	// In "ignore" mode, merge the user's bindings with existing service agent
+	// bindings so that service agents are preserved.
+	if getDefaultBindingBehaviour(d) == "ignore" {
+		existingPolicy, err := updater.GetResourceIamPolicy()
+		if err != nil {
+			return fmt.Errorf("Error reading existing IAM policy for %s: %s", updater.DescribeResource(), err)
+		}
+		serviceAgentBindings := ExtractServiceAgentMembers(existingPolicy.Bindings)
+		policy.Bindings = MergeBindings(append(policy.Bindings, serviceAgentBindings...))
+	}
 
 	err = updater.SetResourceIamPolicy(policy)
 	if err != nil {

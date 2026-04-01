@@ -72,6 +72,30 @@ data "google_iam_policy" "admin" {
 }
 ```
 
+With `default_binding_behaviour` set to `ignore`, Google-managed service agent
+bindings are automatically preserved and excluded from diffs. This mirrors the
+Cloud Console's default view (with the "Include Google-provided role grants"
+checkbox unchecked), making it much easier to manage only the permissions you
+care about:
+
+```hcl
+resource "google_project_iam_policy" "project" {
+  project                    = "your-project-id"
+  policy_data                = data.google_iam_policy.admin.policy_data
+  default_binding_behaviour  = "ignore"
+}
+
+data "google_iam_policy" "admin" {
+  binding {
+    role = "roles/editor"
+
+    members = [
+      "user:jane@example.com",
+    ]
+  }
+}
+```
+
 ## google_project_iam_binding
 
 ```hcl
@@ -171,6 +195,12 @@ The following arguments are supported:
 
     Deleting this removes all policies from the project, locking out users without
     organization-level access.
+
+* `default_binding_behaviour` - (Optional, only for `google_project_iam_policy`) Controls how Google-managed
+    [service agent](https://cloud.google.com/iam/docs/service-agents) bindings are handled. Defaults to `"override"`.
+    Possible values:
+    * `"override"` — (Default) Replaces the entire IAM policy with `policy_data`. Any binding not present in `policy_data` is removed, including service agent bindings.
+    * `"ignore"` — Preserves existing service agent bindings while managing all other bindings authoritatively. Service agent bindings are filtered out of diffs, matching the Cloud Console's default view (with "Include Google-provided role grants" unchecked). On delete, service agent bindings are preserved.
 
 * `project` - (Required) The project id of the target project. This is not
 inferred from the provider.

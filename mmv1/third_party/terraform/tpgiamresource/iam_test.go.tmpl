@@ -1331,3 +1331,285 @@ func TestIamListFromIamAuditConfigsMap(t *testing.T) {
 		}
 	}
 }
+
+func TestIsServiceAgentMember(t *testing.T) {
+	testCases := []struct {
+		member string
+		expect bool
+	}{
+		// Standard service agents
+		{
+			member: "serviceAccount:service-123456789@compute-system.iam.gserviceaccount.com",
+			expect: true,
+		},
+		{
+			member: "serviceAccount:123456789@cloudservices.gserviceaccount.com",
+			expect: true,
+		},
+		{
+			member: "serviceAccount:service-123456789@cloudbuild.gserviceaccount.com",
+			expect: true,
+		},
+		{
+			member: "serviceAccount:service-123456789@container-engine-robot.iam.gserviceaccount.com",
+			expect: true,
+		},
+		{
+			member: "serviceAccount:service-123456789@gcp-sa-pubsub.iam.gserviceaccount.com",
+			expect: true,
+		},
+		{
+			member: "serviceAccount:service-123456789@serverless-robot-prod.iam.gserviceaccount.com",
+			expect: true,
+		},
+		// service-{number}@ pattern with iam.gserviceaccount.com → service agent
+		{
+			member: "serviceAccount:service-123456789@some-new-service.iam.gserviceaccount.com",
+			expect: true,
+		},
+		// Deleted service agents
+		{
+			member: "deleted:serviceAccount:service-123456789@compute-system.iam.gserviceaccount.com?uid=abc123",
+			expect: true,
+		},
+		{
+			member: "deleted:serviceAccount:123456789@cloudservices.gserviceaccount.com?uid=abc123",
+			expect: true,
+		},
+		// Non-service-agent members
+		{
+			member: "user:admin@example.com",
+			expect: false,
+		},
+		{
+			member: "group:admins@example.com",
+			expect: false,
+		},
+		{
+			member: "domain:example.com",
+			expect: false,
+		},
+		{
+			member: "serviceAccount:my-custom-sa@my-project.iam.gserviceaccount.com",
+			expect: false,
+		},
+		{
+			member: "serviceAccount:terraform@my-project.iam.gserviceaccount.com",
+			expect: false,
+		},
+		// User-created service accounts should not be detected as service agents
+		{
+			member: "serviceAccount:my-app@my-project.iam.gserviceaccount.com",
+			expect: false,
+		},
+		// allUsers and allAuthenticatedUsers are not service agents
+		{
+			member: "allUsers",
+			expect: false,
+		},
+		{
+			member: "allAuthenticatedUsers",
+			expect: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		got := IsServiceAgentMember(tc.member)
+		if got != tc.expect {
+			t.Errorf("IsServiceAgentMember(%q) = %v, want %v", tc.member, got, tc.expect)
+		}
+	}
+}
+
+func TestFilterOutServiceAgentMembers(t *testing.T) {
+	testCases := []struct {
+		desc   string
+		input  []*cloudresourcemanager.Binding
+		expect []*cloudresourcemanager.Binding
+	}{
+		{
+			desc:   "empty bindings",
+			input:  []*cloudresourcemanager.Binding{},
+			expect: nil,
+		},
+		{
+			desc: "all service agents removed",
+			input: []*cloudresourcemanager.Binding{
+				{
+					Role:    "roles/editor",
+					Members: []string{"serviceAccount:service-123@compute-system.iam.gserviceaccount.com"},
+				},
+			},
+			expect: nil,
+		},
+		{
+			desc: "all non-service-agents kept",
+			input: []*cloudresourcemanager.Binding{
+				{
+					Role:    "roles/editor",
+					Members: []string{"user:admin@example.com"},
+				},
+			},
+			expect: []*cloudresourcemanager.Binding{
+				{
+					Role:    "roles/editor",
+					Members: []string{"user:admin@example.com"},
+				},
+			},
+		},
+		{
+			desc: "mixed binding splits correctly",
+			input: []*cloudresourcemanager.Binding{
+				{
+					Role: "roles/editor",
+					Members: []string{
+						"user:admin@example.com",
+						"serviceAccount:service-123@compute-system.iam.gserviceaccount.com",
+					},
+				},
+			},
+			expect: []*cloudresourcemanager.Binding{
+				{
+					Role:    "roles/editor",
+					Members: []string{"user:admin@example.com"},
+				},
+			},
+		},
+		{
+			desc: "preserves conditions",
+			input: []*cloudresourcemanager.Binding{
+				{
+					Role:    "roles/viewer",
+					Members: []string{"user:viewer@example.com"},
+					Condition: &cloudresourcemanager.Expr{
+						Title:      "test",
+						Expression: "true",
+					},
+				},
+			},
+			expect: []*cloudresourcemanager.Binding{
+				{
+					Role:    "roles/viewer",
+					Members: []string{"user:viewer@example.com"},
+					Condition: &cloudresourcemanager.Expr{
+						Title:      "test",
+						Expression: "true",
+					},
+				},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			got := FilterOutServiceAgentMembers(tc.input)
+			if tc.expect == nil && got == nil {
+				return
+			}
+			if tc.expect == nil || got == nil {
+				t.Errorf("FilterOutServiceAgentMembers() = %v, want %v", got, tc.expect)
+				return
+			}
+			if len(got) != len(tc.expect) {
+				t.Errorf("FilterOutServiceAgentMembers() returned %d bindings, want %d.\nGot: %s\nExpected: %s",
+					len(got), len(tc.expect), DebugPrintBindings(got), DebugPrintBindings(tc.expect))
+				return
+			}
+			for i := range got {
+				if got[i].Role != tc.expect[i].Role {
+					t.Errorf("Binding[%d].Role = %q, want %q", i, got[i].Role, tc.expect[i].Role)
+				}
+				if !reflect.DeepEqual(got[i].Members, tc.expect[i].Members) {
+					t.Errorf("Binding[%d].Members = %v, want %v", i, got[i].Members, tc.expect[i].Members)
+				}
+			}
+		})
+	}
+}
+
+func TestExtractServiceAgentMembers(t *testing.T) {
+	testCases := []struct {
+		desc   string
+		input  []*cloudresourcemanager.Binding
+		expect []*cloudresourcemanager.Binding
+	}{
+		{
+			desc:   "empty bindings",
+			input:  []*cloudresourcemanager.Binding{},
+			expect: nil,
+		},
+		{
+			desc: "extracts service agents",
+			input: []*cloudresourcemanager.Binding{
+				{
+					Role:    "roles/editor",
+					Members: []string{"serviceAccount:service-123@compute-system.iam.gserviceaccount.com"},
+				},
+			},
+			expect: []*cloudresourcemanager.Binding{
+				{
+					Role:    "roles/editor",
+					Members: []string{"serviceAccount:service-123@compute-system.iam.gserviceaccount.com"},
+				},
+			},
+		},
+		{
+			desc: "non-service-agents excluded",
+			input: []*cloudresourcemanager.Binding{
+				{
+					Role:    "roles/editor",
+					Members: []string{"user:admin@example.com"},
+				},
+			},
+			expect: nil,
+		},
+		{
+			desc: "mixed binding extracts only agents",
+			input: []*cloudresourcemanager.Binding{
+				{
+					Role: "roles/editor",
+					Members: []string{
+						"user:admin@example.com",
+						"serviceAccount:service-123@compute-system.iam.gserviceaccount.com",
+						"serviceAccount:123456@cloudservices.gserviceaccount.com",
+					},
+				},
+			},
+			expect: []*cloudresourcemanager.Binding{
+				{
+					Role: "roles/editor",
+					Members: []string{
+						"serviceAccount:service-123@compute-system.iam.gserviceaccount.com",
+						"serviceAccount:123456@cloudservices.gserviceaccount.com",
+					},
+				},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			got := ExtractServiceAgentMembers(tc.input)
+			if tc.expect == nil && got == nil {
+				return
+			}
+			if tc.expect == nil || got == nil {
+				t.Errorf("ExtractServiceAgentMembers() = %v, want %v", got, tc.expect)
+				return
+			}
+			if len(got) != len(tc.expect) {
+				t.Errorf("ExtractServiceAgentMembers() returned %d bindings, want %d.\nGot: %s\nExpected: %s",
+					len(got), len(tc.expect), DebugPrintBindings(got), DebugPrintBindings(tc.expect))
+				return
+			}
+			for i := range got {
+				if got[i].Role != tc.expect[i].Role {
+					t.Errorf("Binding[%d].Role = %q, want %q", i, got[i].Role, tc.expect[i].Role)
+				}
+				if !reflect.DeepEqual(got[i].Members, tc.expect[i].Members) {
+					t.Errorf("Binding[%d].Members = %v, want %v", i, got[i].Members, tc.expect[i].Members)
+				}
+			}
+		})
+	}
+}
